@@ -18,6 +18,10 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import android.util.Log
 
 class MainActivity : ComponentActivity() { // <-- Alterado aqui
 
@@ -34,9 +38,9 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
 
         // Corrotina para fazer a cópia pesada em segundo plano e não bloquear a App
         lifecycleScope.launch(Dispatchers.IO) {
-            val mapFileOnDisk = File(cacheDir, "portugal.map")
+            val mapFileOnDisk = File(cacheDir, "tagusPark.map")
             if (!mapFileOnDisk.exists()) {
-                assets.open("portugal.map").use { input ->
+                assets.open("tagusPark.map").use { input ->
                     FileOutputStream(mapFileOnDisk).use { output ->
                         input.copyTo(output)
                     }
@@ -66,8 +70,52 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
 
                 mapView.layerManager.layers.add(layer)
 
-                mapView.setCenter(LatLong(38.7169, -9.1399))
+                mapView.setCenter(LatLong(38.736862,-9.302776)) // Tagus Park
                 mapView.setZoomLevel(15.toByte())
+                
+                // Iniciar à escuta do pacote UDP após o mapa estar pronto
+                startUdpServer()
+            }
+        }
+    }
+
+    private fun startUdpServer() {
+        // Lançar rotina secundária (IO Thread) para não bloquear o telemóvel
+        lifecycleScope.launch(Dispatchers.IO) {
+            val port = 5000 // A porta onde o tablet vai estar à escuta
+            var socket: DatagramSocket? = null
+            try {
+                socket = DatagramSocket(port)
+                val buffer = ByteArray(2048)
+                Log.d("AdasMapUDP", "Servidor UDP iniciado na porta $port")
+
+                while (true) {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    // Fica à espera (bloqueante, seguro pq está numa IO thread)
+                    socket.receive(packet)
+                    
+                    val message = String(packet.data, 0, packet.length)
+                    Log.d("AdasMapUDP", "Recebido: $message")
+
+                    try {
+                        val json = JSONObject(message)
+                        if (json.has("lat") && json.has("lon")) {
+                            val lat = json.getDouble("lat")
+                            val lon = json.getDouble("lon")
+
+                            // Voltar para a Thread Principal para mexer na interface/mapa
+                            withContext(Dispatchers.Main) {
+                                mapView.setCenter(LatLong(lat, lon))
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e("AdasMapUDP", "Erro ao processar JSON: ${e.message}")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("AdasMapUDP", "Erro fatal no socket: ${e.message}")
+            } finally {
+                socket?.close()
             }
         }
     }
