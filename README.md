@@ -4,7 +4,12 @@ Lightweight **Advanced Driver Assistance System (ADAS)** mobile application deve
 This app visualizes real-time vehicular data using **Cooperative Awareness Messages (CAMs)** over a VANET environment and displays it on an interactive map powered by OpenStreetMap.
 
 ---
+## 🚧 Project Status
 
+This project is currently under active development as part of a Computer Science and Telecommunications Engineering capstone (PIC) at Instituto Superior Técnico.
+
+Features and documentation are evolving continuously.
+---
 ## 📌 Overview
 
 This project was developed as part of the final project (PIC) for the **Licenciatura em Engenharia de Telecomunicações e Informática (LETI)** at Instituto Superior Técnico (IST).
