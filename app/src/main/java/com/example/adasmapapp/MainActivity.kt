@@ -31,6 +31,36 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
 
     private lateinit var mapView: MapView
     private lateinit var debugText: TextView
+    private lateinit var locationMarker: org.mapsforge.map.layer.overlay.Marker
+    
+    // Dicionário para guardar marcadores de outros veículos (chave: stationID)
+    private val otherVehicles = mutableMapOf<Int, org.mapsforge.map.layer.overlay.Marker>()
+
+    // Função auxiliar para desenhar pontos redondos dinâmicos
+    private fun createDotBitmap(colorHex: String): org.mapsforge.core.graphics.Bitmap {
+        val dotSize = 40
+        val bitmap = android.graphics.Bitmap.createBitmap(dotSize, dotSize, android.graphics.Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(bitmap)
+        
+        // Círculo interior
+        val paint = android.graphics.Paint().apply {
+            color = android.graphics.Color.parseColor(colorHex)
+            isAntiAlias = true
+        }
+        canvas.drawCircle(dotSize / 2f, dotSize / 2f, dotSize / 2f, paint)
+        
+        // Borda branca do ponto
+        val borderPaint = android.graphics.Paint().apply {
+            color = android.graphics.Color.WHITE
+            style = android.graphics.Paint.Style.STROKE
+            strokeWidth = 4f
+            isAntiAlias = true
+        }
+        canvas.drawCircle(dotSize / 2f, dotSize / 2f, (dotSize / 2f) - 2f, borderPaint)
+
+        val drawable = android.graphics.drawable.BitmapDrawable(resources, bitmap)
+        return AndroidGraphicFactory.convertToBitmap(drawable)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -96,6 +126,19 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
 
                 mapView.layerManager.layers.add(layer)
 
+                // ======== CRIAR PONTO AZUL DO NOSSO VEÍCULO (144) ========
+                val markerBitmap = createDotBitmap("#0000FF") // Azul puro
+                
+                locationMarker = org.mapsforge.map.layer.overlay.Marker(
+                    LatLong(38.756862, -9.192776), 
+                    markerBitmap, 
+                    0, 0 // Desvios/Offsets
+                )
+                
+                // Adicionamos o marcador ao mapa (por cima de tudo o resto)
+                mapView.layerManager.layers.add(locationMarker)
+                // ====================================================
+
                 mapView.setCenter(LatLong(38.756862,-9.192776)) // Tagus Park
                 mapView.setZoomLevel(15.toByte())
                 
@@ -133,17 +176,43 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                         if (json.has("latitude") && json.has("longitude")) {
                             val lat = json.getDouble("latitude")
                             val lon = json.getDouble("longitude")
+                            
+                            // Tenta extrair o ID, se não existir um id no JSON assome que é a 144
+                            val stationId = if (json.has("stationID")) json.getInt("stationID") else 144
 
-                            Log.d("AdasMapUDP", "Variáveis lidas do JSON -> Lat: $lat | Lon: $lon")
+                            Log.d("AdasMapUDP", "Variáveis lidas do JSON -> ID: $stationId | Lat: $lat | Lon: $lon")
 
                             // Voltar para a Thread Principal para mexer na interface/mapa
                             withContext(Dispatchers.Main) {
-                                // Mover o centro do mapa para as novas coordenadas
-                                Log.d("AdasMapUDP", "Atualizando o mapa para o novo centro...")
-                                mapView.model.mapViewPosition.center = LatLong(lat, lon)
-                                
-                                // Mostrar também o sucesso no ecrã para debug
-                                debugText.text = "SUCESSO!\nÚltimo pacote recebido:\nLat: $lat\nLon: $lon\nRaw:\n$message"
+                                val newLocation = LatLong(lat, lon)
+
+                                if (stationId == 144) {
+                                    // SOU EU (144) -> Focar a câmara no novo sítio
+                                    Log.d("AdasMapUDP", "Centrando e atualizando o nosso carro (144)")
+                                    mapView.model.mapViewPosition.center = newLocation
+                                    locationMarker.latLong = newLocation
+                                    
+                                    debugText.text = "SUCESSO!\nO Nosso Carro (144):\nLat: $lat\nLon: $lon"
+                                } else {
+                                    // SÃO OUTROS CARROS -> Atualiza posição sem centralizar o ecrã
+                                    if (otherVehicles.containsKey(stationId)) {
+                                        // O carro já estava registado, apenas vamos movê-lo de sítio
+                                        otherVehicles[stationId]?.latLong = newLocation
+                                    } else {
+                                        // Novo vizinho! Vamos apadrinhar com uma cor nova (Vermelho) e registar
+                                        Log.d("AdasMapUDP", "Novo carro desenhado! ID $stationId")
+                                        val otherBitmap = createDotBitmap("#FF0000") // Vermelho
+                                        val newMarker = org.mapsforge.map.layer.overlay.Marker(
+                                            newLocation, 
+                                            otherBitmap, 
+                                            0, 0
+                                        )
+                                        mapView.layerManager.layers.add(newMarker)
+                                        otherVehicles[stationId] = newMarker
+                                    }
+                                    
+                                    debugText.text = "PONTO EXTERNO RECEBIDO!\nCarro $stationId\nLat: $lat | Lon: $lon"
+                                }
                             }
                         } else {
                             Log.w("AdasMapUDP", "O JSON recebido não contém 'latitude' ou 'longitude'")
