@@ -28,7 +28,7 @@ import android.graphics.Color
 import android.view.Gravity
 import org.mapsforge.core.graphics.Style
 import org.mapsforge.core.graphics.Color as MapsforgeColor
-import org.mapsforge.map.layer.overlay.Circle
+import org.mapsforge.map.layer.overlay.Polygon
 import org.mapsforge.map.layer.overlay.Polyline
 import kotlin.math.asin
 import kotlin.math.atan2
@@ -39,14 +39,15 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
 
     private lateinit var mapView: MapView
     private lateinit var debugText: TextView
+    private lateinit var alarmText: TextView // NOVO: Texto de Alarme UI
     
-    // Mantemos o Circle (em metros reais) invisivel para features futuras e o Marker para interface
-    private lateinit var locationCircle: Circle
+    // Mantemos o Polygon (em metros reais) invisivel para features futuras e o Marker para interface
+    private lateinit var locationPolygon: Polygon
     private lateinit var locationMarker: org.mapsforge.map.layer.overlay.Marker
     private var locationLine: Polyline? = null // Linha amarela de previsão
     
     // Dicionário para guardar as instâncias de outros veículos (chave: stationID)
-    inner class VehicleData(var circle: Circle, var marker: org.mapsforge.map.layer.overlay.Marker, var line: Polyline?)
+    inner class VehicleData(var polygon: Polygon, var marker: org.mapsforge.map.layer.overlay.Marker, var line: Polyline?)
     private val otherVehicles = mutableMapOf<Int, VehicleData>()
 
     // Função auxiliar para desenhar o Marker visual (tamanho fixo em pixeis)
@@ -73,17 +74,14 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
         return AndroidGraphicFactory.convertToBitmap(drawable)
     }
 
-    // Função auxiliar para desenhar um círculo geográfico real de raio definido
-    private fun createVehicleCircle(latLong: LatLong, radiusMeters: Float, colorEnum: MapsforgeColor): Circle {
+    // Função auxiliar para desenhar um polígono geográfico (retângulo do carro)
+    private fun createVehiclePolygon(center: LatLong, lengthMs: Double, widthMs: Double, headingDeg: Double, colorEnum: MapsforgeColor): Polygon {
         val graphicFactory = AndroidGraphicFactory.INSTANCE
         
         val paintFill = graphicFactory.createPaint()
-        // Alguns compiladores Mapsforge usam diretamente enum, outros pedem int, usamos int nativo do android como fallback seguro caso seja int
         try {
             paintFill.setColor(graphicFactory.createColor(colorEnum))
-        } catch (e: NoSuchMethodError) {
-             // Fallback para versões mapsforge
-        }
+        } catch (e: NoSuchMethodError) {}
         paintFill.setStyle(Style.FILL)
         
         val paintStroke = graphicFactory.createPaint()
@@ -93,7 +91,39 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
         paintStroke.setStyle(Style.STROKE)
         paintStroke.setStrokeWidth(4f)
 
-        return Circle(latLong, radiusMeters, paintFill, paintStroke)
+        val polygon = Polygon(paintFill, paintStroke, graphicFactory)
+        
+        val rEarth = 6378137.0
+        val centerLat = Math.toRadians(center.latitude)
+        val centerLon = Math.toRadians(center.longitude)
+        val angle = Math.toRadians(headingDeg)
+        
+        // Metros a partir do centro (x = direita/esquerda, y = frente/trás)
+        val dx = widthMs / 2.0
+        val dy = lengthMs / 2.0
+        
+        val corners = listOf(
+            Pair(-dx, dy), // Frente-Esquerda
+            Pair(dx, dy),  // Frente-Direita
+            Pair(dx, -dy), // Trás-Direita
+            Pair(-dx, -dy) // Trás-Esquerda
+        )
+        
+        for (corner in corners) {
+            val cx = corner.first
+            val cy = corner.second
+            
+            // Rotação seguindo o heading (ângulo começa no Norte 0, e avança no sentido dos ponteiros do relógio)
+            val rx = cx * cos(angle) + cy * sin(angle)
+            val ry = -cx * sin(angle) + cy * cos(angle)
+            
+            val dLat = ry / rEarth
+            val dLon = rx / (rEarth * cos(centerLat)) // ajustado pela latitude
+            
+            polygon.latLongs.add(LatLong(Math.toDegrees(centerLat + dLat), Math.toDegrees(centerLon + dLon)))
+        }
+        
+        return polygon
     }
 
     // Função que prevê onde o carro vai estar em X segundos projetando uma Polyline Amarela Reta a partir do heading e speed.
@@ -134,6 +164,79 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
         return polyline
     }
 
+    // --- FUNÇÕES DE DETEÇÃO DE COLISÃO ---
+    private fun checkCollisions(): Boolean {
+        if (locationLine == null || locationLine!!.latLongs.size < 2) return false
+        val myStart = locationLine!!.latLongs[0]
+        val myEnd = locationLine!!.latLongs[1]
+
+        for ((id, data) in otherVehicles) {
+            val theirStart = data.marker.latLong
+            val theirLine = data.line
+            val theirPolygonPoints = data.polygon.latLongs
+
+            // 1. A nossa linha cruza-se com o retângulo de bounding do vizinho?
+            if (theirPolygonPoints.size >= 4) {
+                // Testar intersecção com cada segmento do polígono (retângulo)
+                for (i in 0 until 4) {
+                    val p3 = theirPolygonPoints[i]
+                    val p4 = theirPolygonPoints[(i + 1) % 4]
+                    if (segmentsIntersect(myStart, myEnd, p3, p4)) {
+                        return true
+                    }
+                }
+            }
+
+            // 2. A nossa linha cruza-se com a linha de predição deles?
+            if (theirLine != null && theirLine.latLongs.size >= 2) {
+                val theirEnd = theirLine.latLongs[1]
+                if (segmentsIntersect(myStart, myEnd, theirStart, theirEnd)) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    private fun segmentsIntersect(p1: LatLong, p2: LatLong, p3: LatLong, p4: LatLong): Boolean {
+        // Função matemática simples para saber se as retas P1-P2 e P3-P4 se intersetam 
+        // Usamos counter-clockwise check para testar os eixos cartesianos topológicos puros
+        fun ccw(a: LatLong, b: LatLong, c: LatLong): Boolean {
+            return (c.latitude - a.latitude) * (b.longitude - a.longitude) > (b.latitude - a.latitude) * (c.longitude - a.longitude)
+        }
+        return (ccw(p1, p3, p4) != ccw(p2, p3, p4)) && (ccw(p1, p2, p3) != ccw(p1, p2, p4))
+    }
+
+    private fun distancePointToSegment(p: LatLong, a: LatLong, b: LatLong): Double {
+        // Aproximação esférica rápida -> Converter Lat/Lon em cartesianos 2D na área local X/Y em Metros (relativos a A)
+        val rEarth = 6371000.0
+        val latA = Math.toRadians(a.latitude)
+        
+        fun toX(lon: Double) = rEarth * Math.toRadians(lon - a.longitude) * Math.cos(latA)
+        fun toY(lat: Double) = rEarth * Math.toRadians(lat - a.latitude)
+
+        val px = toX(p.longitude)
+        val py = toY(p.latitude)
+        val bx = toX(b.longitude)
+        val by = toY(b.latitude)
+
+        // Distância de P = (px, py) até segmento A=(0,0) - B=(bx, by)
+        val lengthSquared = bx * bx + by * by
+        if (lengthSquared == 0.0) return Math.sqrt(px * px + py * py)
+
+        // Projeção matemática normalizada [0.0 > t > 1.0] garantida não falhar nos extremos da linha
+        var t = (px * bx + py * by) / lengthSquared
+        t = Math.max(0.0, java.lang.Math.min(1.0, t))
+
+        val projX = t * bx
+        val projY = t * by
+
+        val dx = px - projX
+        val dy = py - projY
+        return Math.sqrt(dx * dx + dy * dy)
+    }
+    // -------------------------------------
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -161,6 +264,26 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
             gravity = Gravity.BOTTOM // Fica colado à parte de baixo do ecrã
         }
         frameLayout.addView(debugText, params)
+
+        // ======= ALARME DE COLISÃO =========
+        alarmText = TextView(this).apply {
+            text = "⚠ PERIGO DE COLISÃO! ⚠"
+            setBackgroundColor(Color.RED)
+            setTextColor(Color.WHITE)
+            setPadding(32, 32, 32, 32)
+            textSize = 22f
+            gravity = Gravity.CENTER
+            visibility = android.view.View.GONE // Escondido por defeito
+            elevation = 10f // Manter na frente do mapa
+        }
+        val alarmParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, 
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.TOP // Fica colado no topo
+        }
+        frameLayout.addView(alarmText, alarmParams)
+        // ===================================
 
         setContentView(frameLayout)
 
@@ -201,9 +324,9 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                 // ======== CRIAR AS 2 CAMADAS DO NOSSO VEÍCULO (144) ========
                 val initialLoc = LatLong(38.756862, -9.192776)
                 
-                // 1) Circulo geográfico transparente/invisível para testes futuros
-                locationCircle = createVehicleCircle(initialLoc, 2f, MapsforgeColor.TRANSPARENT)
-                mapView.layerManager.layers.add(locationCircle)
+                // 1) Polígono geográfico transparente/invisível (Retângulo a simular o carro)
+                locationPolygon = createVehiclePolygon(initialLoc, 4.0, 2.0, 0.0, MapsforgeColor.TRANSPARENT)
+                mapView.layerManager.layers.add(locationPolygon)
                 
                 // 2) Marker visual (Bolinha que vemos)
                 val markerBitmap = createDotBitmap("#0000FF") // Azul
@@ -254,6 +377,8 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                             
                             val speedMs = if (json.has("speed")) json.getDouble("speed") else 0.0
                             val headingDeg = if (json.has("heading")) json.getDouble("heading") else 3601.0
+                            val length = if (json.has("length")) json.getDouble("length") else 4.0
+                            val width = if (json.has("width")) json.getDouble("width") else 2.0
 
                             Log.d("AdasMapUDP", "Variáveis lidas do JSON -> ID: $stationId | Lat: $lat | Lon: $lon")
 
@@ -269,10 +394,10 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                                     // 1) Atualiza marcador visual (permite setLatLong on-the-fly)
                                     locationMarker.latLong = newLocation
                                     
-                                    // 2) Atualiza o Circle transparente recriando a camada
-                                    mapView.layerManager.layers.remove(locationCircle)
-                                    locationCircle = createVehicleCircle(newLocation, 2f, MapsforgeColor.TRANSPARENT)
-                                    mapView.layerManager.layers.add(locationCircle)
+                                    // 2) Atualiza o Polígono transparente recriando a camada
+                                    mapView.layerManager.layers.remove(locationPolygon)
+                                    locationPolygon = createVehiclePolygon(newLocation, length, width, headingDeg, MapsforgeColor.TRANSPARENT)
+                                    mapView.layerManager.layers.add(locationPolygon)
                                     
                                     // 3) Atualiza a linha de predição Amarela
                                     if (locationLine != null) mapView.layerManager.layers.remove(locationLine)
@@ -288,11 +413,11 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                                         // 1) Atualiza marker visual
                                         oldData.marker.latLong = newLocation
                                         
-                                        // 2) Atualiza circulo invisível por baixo
-                                        mapView.layerManager.layers.remove(oldData.circle)
-                                        val newCircle = createVehicleCircle(newLocation, 2f, MapsforgeColor.TRANSPARENT)
-                                        mapView.layerManager.layers.add(newCircle)
-                                        oldData.circle = newCircle
+                                        // 2) Atualiza polígono invisível por baixo
+                                        mapView.layerManager.layers.remove(oldData.polygon)
+                                        val newPolygon = createVehiclePolygon(newLocation, length, width, headingDeg, MapsforgeColor.TRANSPARENT)
+                                        mapView.layerManager.layers.add(newPolygon)
+                                        oldData.polygon = newPolygon
                                         
                                         // 3) Atualiza a linha do vizinho
                                         if (oldData.line != null) mapView.layerManager.layers.remove(oldData.line)
@@ -308,21 +433,28 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                                         val otherBitmap = createDotBitmap("#FF0000") // Vermelho
                                         val newMarker = org.mapsforge.map.layer.overlay.Marker(newLocation, otherBitmap, 0, 0)
                                         
-                                        // Cria circulo invisivel por baixo
-                                        val newCircle = createVehicleCircle(newLocation, 2f, MapsforgeColor.TRANSPARENT)
+                                        // Cria polígono invisivel por baixo
+                                        val newPolygon = createVehiclePolygon(newLocation, length, width, headingDeg, MapsforgeColor.TRANSPARENT)
                                         
                                         // Cria Linha Amarela nova
                                         val newLine = createPredictionLine(newLocation, speedMs, headingDeg)
                                         
                                         // Adiciona à UI
                                         if (newLine != null) mapView.layerManager.layers.add(newLine)
-                                        mapView.layerManager.layers.add(newCircle)
+                                        mapView.layerManager.layers.add(newPolygon)
                                         mapView.layerManager.layers.add(newMarker) // Marker por cima da linha
                                         
-                                        otherVehicles[stationId] = VehicleData(newCircle, newMarker, newLine)
+                                        otherVehicles[stationId] = VehicleData(newPolygon, newMarker, newLine)
                                     }
                                     
                                     debugText.text = "PONTO RECEBIDO!\nCarro $stationId\nVelocidade: $speedMs"
+                                }
+                                
+                                // ======== VERIFICAR COLISÕES A CADA ATUALIZAÇÃO ========
+                                if (checkCollisions()) {
+                                    alarmText.visibility = android.view.View.VISIBLE
+                                } else {
+                                    alarmText.visibility = android.view.View.GONE
                                 }
                             }
                         } else {
