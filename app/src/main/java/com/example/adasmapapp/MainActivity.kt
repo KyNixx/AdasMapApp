@@ -26,30 +26,41 @@ import android.widget.FrameLayout
 import android.widget.TextView
 import android.graphics.Color
 import android.view.Gravity
+import org.mapsforge.core.graphics.Style
+import org.mapsforge.core.graphics.Color as MapsforgeColor
+import org.mapsforge.map.layer.overlay.Circle
+import org.mapsforge.map.layer.overlay.Polyline
+import kotlin.math.asin
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.sin
 
 class MainActivity : ComponentActivity() { // <-- Alterado aqui
 
     private lateinit var mapView: MapView
     private lateinit var debugText: TextView
-    private lateinit var locationMarker: org.mapsforge.map.layer.overlay.Marker
     
-    // Dicionário para guardar marcadores de outros veículos (chave: stationID)
-    private val otherVehicles = mutableMapOf<Int, org.mapsforge.map.layer.overlay.Marker>()
+    // Mantemos o Circle (em metros reais) invisivel para features futuras e o Marker para interface
+    private lateinit var locationCircle: Circle
+    private lateinit var locationMarker: org.mapsforge.map.layer.overlay.Marker
+    private var locationLine: Polyline? = null // Linha amarela de previsão
+    
+    // Dicionário para guardar as instâncias de outros veículos (chave: stationID)
+    inner class VehicleData(var circle: Circle, var marker: org.mapsforge.map.layer.overlay.Marker, var line: Polyline?)
+    private val otherVehicles = mutableMapOf<Int, VehicleData>()
 
-    // Função auxiliar para desenhar pontos redondos dinâmicos
+    // Função auxiliar para desenhar o Marker visual (tamanho fixo em pixeis)
     private fun createDotBitmap(colorHex: String): org.mapsforge.core.graphics.Bitmap {
         val dotSize = 40
         val bitmap = android.graphics.Bitmap.createBitmap(dotSize, dotSize, android.graphics.Bitmap.Config.ARGB_8888)
         val canvas = android.graphics.Canvas(bitmap)
         
-        // Círculo interior
         val paint = android.graphics.Paint().apply {
             color = android.graphics.Color.parseColor(colorHex)
             isAntiAlias = true
         }
         canvas.drawCircle(dotSize / 2f, dotSize / 2f, dotSize / 2f, paint)
         
-        // Borda branca do ponto
         val borderPaint = android.graphics.Paint().apply {
             color = android.graphics.Color.WHITE
             style = android.graphics.Paint.Style.STROKE
@@ -60,6 +71,67 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
 
         val drawable = android.graphics.drawable.BitmapDrawable(resources, bitmap)
         return AndroidGraphicFactory.convertToBitmap(drawable)
+    }
+
+    // Função auxiliar para desenhar um círculo geográfico real de raio definido
+    private fun createVehicleCircle(latLong: LatLong, radiusMeters: Float, colorEnum: MapsforgeColor): Circle {
+        val graphicFactory = AndroidGraphicFactory.INSTANCE
+        
+        val paintFill = graphicFactory.createPaint()
+        // Alguns compiladores Mapsforge usam diretamente enum, outros pedem int, usamos int nativo do android como fallback seguro caso seja int
+        try {
+            paintFill.setColor(graphicFactory.createColor(colorEnum))
+        } catch (e: NoSuchMethodError) {
+             // Fallback para versões mapsforge
+        }
+        paintFill.setStyle(Style.FILL)
+        
+        val paintStroke = graphicFactory.createPaint()
+        // Se a cor pedida for TRANSPARENT, a borda também fica transparente para ficar 100% invisível
+        val strokeColor = if (colorEnum == MapsforgeColor.TRANSPARENT) MapsforgeColor.TRANSPARENT else MapsforgeColor.WHITE
+        paintStroke.setColor(graphicFactory.createColor(strokeColor))
+        paintStroke.setStyle(Style.STROKE)
+        paintStroke.setStrokeWidth(4f)
+
+        return Circle(latLong, radiusMeters, paintFill, paintStroke)
+    }
+
+    // Função que prevê onde o carro vai estar em X segundos projetando uma Polyline Amarela Reta a partir do heading e speed.
+    private fun createPredictionLine(start: LatLong, speedMs: Double, headingDeg: Double): Polyline? {
+        // Segundo os testes do formato CAM ITS, heading é impossivel se for 3601 / speed invalido > 163
+        if (headingDeg >= 360.0 || speedMs < 0.1 || speedMs >= 163.0) return null 
+        
+        val forecastSeconds = 4.0
+        val distanceMeters = speedMs * forecastSeconds
+
+        val rEarth = 6378137.0 // Raio da Terra em Metros
+        val lat1 = Math.toRadians(start.latitude)
+        val lon1 = Math.toRadians(start.longitude)
+        val brng = Math.toRadians(headingDeg)
+        val angularDist = distanceMeters / rEarth
+
+        // Fórmulas Geográficas esféricas
+        val lat2 = asin(sin(lat1) * cos(angularDist) + cos(lat1) * sin(angularDist) * cos(brng))
+        val lon2 = lon1 + atan2(sin(brng) * sin(angularDist) * cos(lat1), cos(angularDist) - sin(lat1) * sin(lat2))
+        
+        val end = LatLong(Math.toDegrees(lat2), Math.toDegrees(lon2))
+
+        val graphicFactory = AndroidGraphicFactory.INSTANCE
+        val paintStroke = graphicFactory.createPaint()
+        // MapsforgeColor pode não ter YELLOW, usamos Android Color
+        try {
+            paintStroke.setColor(android.graphics.Color.YELLOW)
+        } catch (e: Exception) {
+            paintStroke.setColor(graphicFactory.createColor(MapsforgeColor.RED)) // Falha segura
+        }
+        paintStroke.setStyle(Style.STROKE)
+        paintStroke.setStrokeWidth(6f) // Linha visível! Pode configurar para 8f ou 10f se quiser mais grossa
+        
+        val polyline = Polyline(paintStroke, graphicFactory)
+        polyline.latLongs.add(start)
+        polyline.latLongs.add(end)
+        
+        return polyline
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -126,16 +198,16 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
 
                 mapView.layerManager.layers.add(layer)
 
-                // ======== CRIAR PONTO AZUL DO NOSSO VEÍCULO (144) ========
-                val markerBitmap = createDotBitmap("#0000FF") // Azul puro
+                // ======== CRIAR AS 2 CAMADAS DO NOSSO VEÍCULO (144) ========
+                val initialLoc = LatLong(38.756862, -9.192776)
                 
-                locationMarker = org.mapsforge.map.layer.overlay.Marker(
-                    LatLong(38.756862, -9.192776), 
-                    markerBitmap, 
-                    0, 0 // Desvios/Offsets
-                )
+                // 1) Circulo geográfico transparente/invisível para testes futuros
+                locationCircle = createVehicleCircle(initialLoc, 2f, MapsforgeColor.TRANSPARENT)
+                mapView.layerManager.layers.add(locationCircle)
                 
-                // Adicionamos o marcador ao mapa (por cima de tudo o resto)
+                // 2) Marker visual (Bolinha que vemos)
+                val markerBitmap = createDotBitmap("#0000FF") // Azul
+                locationMarker = org.mapsforge.map.layer.overlay.Marker(initialLoc, markerBitmap, 0, 0)
                 mapView.layerManager.layers.add(locationMarker)
                 // ====================================================
 
@@ -179,6 +251,9 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                             
                             // Tenta extrair o ID, se não existir um id no JSON assome que é a 144
                             val stationId = if (json.has("stationID")) json.getInt("stationID") else 144
+                            
+                            val speedMs = if (json.has("speed")) json.getDouble("speed") else 0.0
+                            val headingDeg = if (json.has("heading")) json.getDouble("heading") else 3601.0
 
                             Log.d("AdasMapUDP", "Variáveis lidas do JSON -> ID: $stationId | Lat: $lat | Lon: $lon")
 
@@ -190,28 +265,64 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                                     // SOU EU (144) -> Focar a câmara no novo sítio
                                     Log.d("AdasMapUDP", "Centrando e atualizando o nosso carro (144)")
                                     mapView.model.mapViewPosition.center = newLocation
+                                    
+                                    // 1) Atualiza marcador visual (permite setLatLong on-the-fly)
                                     locationMarker.latLong = newLocation
                                     
-                                    debugText.text = "SUCESSO!\nO Nosso Carro (144):\nLat: $lat\nLon: $lon"
+                                    // 2) Atualiza o Circle transparente recriando a camada
+                                    mapView.layerManager.layers.remove(locationCircle)
+                                    locationCircle = createVehicleCircle(newLocation, 2f, MapsforgeColor.TRANSPARENT)
+                                    mapView.layerManager.layers.add(locationCircle)
+                                    
+                                    // 3) Atualiza a linha de predição Amarela
+                                    if (locationLine != null) mapView.layerManager.layers.remove(locationLine)
+                                    locationLine = createPredictionLine(newLocation, speedMs, headingDeg)
+                                    if (locationLine != null) mapView.layerManager.layers.add(locationLine)
+                                    
+                                    debugText.text = "SUCESSO!\nO Nosso Carro (144):\nLat: $lat\nLon: $lon\nVel: $speedMs m/s"
                                 } else {
                                     // SÃO OUTROS CARROS -> Atualiza posição sem centralizar o ecrã
                                     if (otherVehicles.containsKey(stationId)) {
-                                        // O carro já estava registado, apenas vamos movê-lo de sítio
-                                        otherVehicles[stationId]?.latLong = newLocation
+                                        val oldData = otherVehicles[stationId]!!
+                                        
+                                        // 1) Atualiza marker visual
+                                        oldData.marker.latLong = newLocation
+                                        
+                                        // 2) Atualiza circulo invisível por baixo
+                                        mapView.layerManager.layers.remove(oldData.circle)
+                                        val newCircle = createVehicleCircle(newLocation, 2f, MapsforgeColor.TRANSPARENT)
+                                        mapView.layerManager.layers.add(newCircle)
+                                        oldData.circle = newCircle
+                                        
+                                        // 3) Atualiza a linha do vizinho
+                                        if (oldData.line != null) mapView.layerManager.layers.remove(oldData.line)
+                                        val newLine = createPredictionLine(newLocation, speedMs, headingDeg)
+                                        if (newLine != null) mapView.layerManager.layers.add(newLine)
+                                        oldData.line = newLine
+                                        
                                     } else {
-                                        // Novo vizinho! Vamos apadrinhar com uma cor nova (Vermelho) e registar
+                                        // Novo vizinho!
                                         Log.d("AdasMapUDP", "Novo carro desenhado! ID $stationId")
+                                        
+                                        // Cria bolinha vermelha estática
                                         val otherBitmap = createDotBitmap("#FF0000") // Vermelho
-                                        val newMarker = org.mapsforge.map.layer.overlay.Marker(
-                                            newLocation, 
-                                            otherBitmap, 
-                                            0, 0
-                                        )
-                                        mapView.layerManager.layers.add(newMarker)
-                                        otherVehicles[stationId] = newMarker
+                                        val newMarker = org.mapsforge.map.layer.overlay.Marker(newLocation, otherBitmap, 0, 0)
+                                        
+                                        // Cria circulo invisivel por baixo
+                                        val newCircle = createVehicleCircle(newLocation, 2f, MapsforgeColor.TRANSPARENT)
+                                        
+                                        // Cria Linha Amarela nova
+                                        val newLine = createPredictionLine(newLocation, speedMs, headingDeg)
+                                        
+                                        // Adiciona à UI
+                                        if (newLine != null) mapView.layerManager.layers.add(newLine)
+                                        mapView.layerManager.layers.add(newCircle)
+                                        mapView.layerManager.layers.add(newMarker) // Marker por cima da linha
+                                        
+                                        otherVehicles[stationId] = VehicleData(newCircle, newMarker, newLine)
                                     }
                                     
-                                    debugText.text = "PONTO EXTERNO RECEBIDO!\nCarro $stationId\nLat: $lat | Lon: $lon"
+                                    debugText.text = "PONTO RECEBIDO!\nCarro $stationId\nVelocidade: $speedMs"
                                 }
                             }
                         } else {
