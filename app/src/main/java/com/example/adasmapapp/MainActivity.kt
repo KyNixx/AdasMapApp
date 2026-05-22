@@ -18,6 +18,7 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
 import org.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -41,38 +42,13 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
     private lateinit var debugText: TextView
     private lateinit var alarmText: TextView // NOVO: Texto de Alarme UI
     
-    // Mantemos o Polygon (em metros reais) invisivel para features futuras e o Marker para interface
+    // Mantemos apenas o Polygon (em metros reais) como representação visual
     private lateinit var locationPolygon: Polygon
-    private lateinit var locationMarker: org.mapsforge.map.layer.overlay.Marker
     private var locationLine: Polyline? = null // Linha amarela de previsão
     
     // Dicionário para guardar as instâncias de outros veículos (chave: stationID)
-    inner class VehicleData(var polygon: Polygon, var marker: org.mapsforge.map.layer.overlay.Marker, var line: Polyline?)
+    inner class VehicleData(var polygon: Polygon, var center: LatLong, var line: Polyline?, var lastUpdateTime: Long)
     private val otherVehicles = mutableMapOf<Int, VehicleData>()
-
-    // Função auxiliar para desenhar o Marker visual (tamanho fixo em pixeis)
-    private fun createDotBitmap(colorHex: String): org.mapsforge.core.graphics.Bitmap {
-        val dotSize = 40
-        val bitmap = android.graphics.Bitmap.createBitmap(dotSize, dotSize, android.graphics.Bitmap.Config.ARGB_8888)
-        val canvas = android.graphics.Canvas(bitmap)
-        
-        val paint = android.graphics.Paint().apply {
-            color = android.graphics.Color.parseColor(colorHex)
-            isAntiAlias = true
-        }
-        canvas.drawCircle(dotSize / 2f, dotSize / 2f, dotSize / 2f, paint)
-        
-        val borderPaint = android.graphics.Paint().apply {
-            color = android.graphics.Color.WHITE
-            style = android.graphics.Paint.Style.STROKE
-            strokeWidth = 4f
-            isAntiAlias = true
-        }
-        canvas.drawCircle(dotSize / 2f, dotSize / 2f, (dotSize / 2f) - 2f, borderPaint)
-
-        val drawable = android.graphics.drawable.BitmapDrawable(resources, bitmap)
-        return AndroidGraphicFactory.convertToBitmap(drawable)
-    }
 
     // Função auxiliar para desenhar um polígono geográfico (retângulo do carro)
     private fun createVehiclePolygon(center: LatLong, lengthMs: Double, widthMs: Double, headingDeg: Double, colorEnum: MapsforgeColor): Polygon {
@@ -171,7 +147,7 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
         val myEnd = locationLine!!.latLongs[1]
 
         for ((id, data) in otherVehicles) {
-            val theirStart = data.marker.latLong
+            val theirStart = data.center
             val theirLine = data.line
             val theirPolygonPoints = data.polygon.latLongs
 
@@ -321,21 +297,16 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
 
                 mapView.layerManager.layers.add(layer)
 
-                // ======== CRIAR AS 2 CAMADAS DO NOSSO VEÍCULO (144) ========
+                // ======== CRIAR A CAMADA DO NOSSO VEÍCULO (144) ========
                 val initialLoc = LatLong(38.756862, -9.192776)
                 
-                // 1) Polígono geográfico transparente/invisível (Retângulo a simular o carro)
-                locationPolygon = createVehiclePolygon(initialLoc, 4.0, 2.0, 0.0, MapsforgeColor.TRANSPARENT)
+                // Polígono geográfico (Retângulo Azul a simular o carro)
+                locationPolygon = createVehiclePolygon(initialLoc, 4.0, 2.0, 0.0, MapsforgeColor.BLUE)
                 mapView.layerManager.layers.add(locationPolygon)
-                
-                // 2) Marker visual (Bolinha que vemos)
-                val markerBitmap = createDotBitmap("#0000FF") // Azul
-                locationMarker = org.mapsforge.map.layer.overlay.Marker(initialLoc, markerBitmap, 0, 0)
-                mapView.layerManager.layers.add(locationMarker)
                 // ====================================================
 
                 mapView.setCenter(LatLong(38.756862,-9.192776)) // Tagus Park
-                mapView.setZoomLevel(15.toByte())
+                mapView.setZoomLevel(19.toByte()) // Zoom mais próximo para contexto ADAS
                 
                 // Iniciar à escuta do pacote UDP após o mapa estar pronto
                 startUdpServer()
@@ -344,6 +315,29 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
     }
 
     private fun startUdpServer() {
+        // Rotina secundária na Thread Principal para "limpar" os carros inativos
+        lifecycleScope.launch(Dispatchers.Main) {
+            while (true) {
+                val now = System.currentTimeMillis()
+                val iterator = otherVehicles.entries.iterator()
+                while (iterator.hasNext()) {
+                    val entry = iterator.next()
+                    if (now - entry.value.lastUpdateTime > 3000L) { // 3 segundos sem pacotes
+                        mapView.layerManager.layers.remove(entry.value.polygon)
+                        if (entry.value.line != null) mapView.layerManager.layers.remove(entry.value.line)
+                        iterator.remove()
+                        Log.d("AdasMapUDP", "Carro inativo removido: ID ${entry.key}")
+                    }
+                }
+                
+                // Forçar a verificação de alarmes (caso o causador da colisão tenha sido removido)
+                val isColliding = checkCollisions()
+                alarmText.visibility = if (isColliding) android.view.View.VISIBLE else android.view.View.GONE
+                
+                delay(1000) // Repetir a verificação a cada 1 segundo
+            }
+        }
+
         // Lançar rotina secundária (IO Thread) para não bloquear o telemóvel
         lifecycleScope.launch(Dispatchers.IO) {
             val port = 5000 // A porta onde o tablet vai estar à escuta
@@ -391,15 +385,12 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                                     Log.d("AdasMapUDP", "Centrando e atualizando o nosso carro (144)")
                                     mapView.model.mapViewPosition.center = newLocation
                                     
-                                    // 1) Atualiza marcador visual (permite setLatLong on-the-fly)
-                                    locationMarker.latLong = newLocation
-                                    
-                                    // 2) Atualiza o Polígono transparente recriando a camada
+                                    // 1) Atualiza o Polígono recriando a camada (Azul para nós)
                                     mapView.layerManager.layers.remove(locationPolygon)
-                                    locationPolygon = createVehiclePolygon(newLocation, length, width, headingDeg, MapsforgeColor.TRANSPARENT)
+                                    locationPolygon = createVehiclePolygon(newLocation, length, width, headingDeg, MapsforgeColor.BLUE)
                                     mapView.layerManager.layers.add(locationPolygon)
                                     
-                                    // 3) Atualiza a linha de predição Amarela
+                                    // 2) Atualiza a linha de predição Amarela
                                     if (locationLine != null) mapView.layerManager.layers.remove(locationLine)
                                     locationLine = createPredictionLine(newLocation, speedMs, headingDeg)
                                     if (locationLine != null) mapView.layerManager.layers.add(locationLine)
@@ -410,12 +401,12 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                                     if (otherVehicles.containsKey(stationId)) {
                                         val oldData = otherVehicles[stationId]!!
                                         
-                                        // 1) Atualiza marker visual
-                                        oldData.marker.latLong = newLocation
+                                        // 1) Atualiza o centro guardado
+                                        oldData.center = newLocation
                                         
-                                        // 2) Atualiza polígono invisível por baixo
+                                        // 2) Atualiza polígono visível (vermelho)
                                         mapView.layerManager.layers.remove(oldData.polygon)
-                                        val newPolygon = createVehiclePolygon(newLocation, length, width, headingDeg, MapsforgeColor.TRANSPARENT)
+                                        val newPolygon = createVehiclePolygon(newLocation, length, width, headingDeg, MapsforgeColor.RED)
                                         mapView.layerManager.layers.add(newPolygon)
                                         oldData.polygon = newPolygon
                                         
@@ -425,16 +416,15 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                                         if (newLine != null) mapView.layerManager.layers.add(newLine)
                                         oldData.line = newLine
                                         
+                                        // 4) Regista a hora desta atualização
+                                        oldData.lastUpdateTime = System.currentTimeMillis()
+                                        
                                     } else {
                                         // Novo vizinho!
                                         Log.d("AdasMapUDP", "Novo carro desenhado! ID $stationId")
                                         
-                                        // Cria bolinha vermelha estática
-                                        val otherBitmap = createDotBitmap("#FF0000") // Vermelho
-                                        val newMarker = org.mapsforge.map.layer.overlay.Marker(newLocation, otherBitmap, 0, 0)
-                                        
-                                        // Cria polígono invisivel por baixo
-                                        val newPolygon = createVehiclePolygon(newLocation, length, width, headingDeg, MapsforgeColor.TRANSPARENT)
+                                        // Cria polígono visível (Vermelho)
+                                        val newPolygon = createVehiclePolygon(newLocation, length, width, headingDeg, MapsforgeColor.RED)
                                         
                                         // Cria Linha Amarela nova
                                         val newLine = createPredictionLine(newLocation, speedMs, headingDeg)
@@ -442,12 +432,11 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                                         // Adiciona à UI
                                         if (newLine != null) mapView.layerManager.layers.add(newLine)
                                         mapView.layerManager.layers.add(newPolygon)
-                                        mapView.layerManager.layers.add(newMarker) // Marker por cima da linha
                                         
-                                        otherVehicles[stationId] = VehicleData(newPolygon, newMarker, newLine)
+                                        otherVehicles[stationId] = VehicleData(newPolygon, newLocation, newLine, System.currentTimeMillis())
                                     }
                                     
-                                    debugText.text = "PONTO RECEBIDO!\nCarro $stationId\nVelocidade: $speedMs"
+                                    debugText.text = "PONTO RECEBIDO!\nCarro $stationId\nVelocidade: $speedMs m/s"
                                 }
                                 
                                 // ======== VERIFICAR COLISÕES A CADA ATUALIZAÇÃO ========
