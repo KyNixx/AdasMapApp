@@ -45,9 +45,11 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
     // Mantemos apenas o Polygon (em metros reais) como representação visual
     private lateinit var locationPolygon: Polygon
     private var locationLine: Polyline? = null // Linha amarela de previsão
+    private var overtakingLine: Polyline? = null // Linha de ultrapassagem traseira
+    private var myHeadingDeg: Double = 0.0
     
     // Dicionário para guardar as instâncias de outros veículos (chave: stationID)
-    inner class VehicleData(var polygon: Polygon, var center: LatLong, var line: Polyline?, var lastUpdateTime: Long)
+    inner class VehicleData(var polygon: Polygon, var center: LatLong, var line: Polyline?, var lastUpdateTime: Long, var headingDeg: Double)
     private val otherVehicles = mutableMapOf<Int, VehicleData>()
 
     // Função auxiliar para desenhar um polígono geográfico (retângulo do carro)
@@ -124,7 +126,6 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
 
         val graphicFactory = AndroidGraphicFactory.INSTANCE
         val paintStroke = graphicFactory.createPaint()
-        // MapsforgeColor pode não ter YELLOW, usamos Android Color
         try {
             paintStroke.setColor(android.graphics.Color.YELLOW)
         } catch (e: Exception) {
@@ -136,6 +137,49 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
         val polyline = Polyline(paintStroke, graphicFactory)
         polyline.latLongs.add(start)
         polyline.latLongs.add(end)
+        
+        return polyline
+    }
+
+    // Função para criar a linha perpendicular de deteção de ultrapassagem atrás do nosso carro
+    private fun createOvertakingLine(center: LatLong, lengthMs: Double, widthMs: Double, headingDeg: Double): Polyline? {
+        if (headingDeg >= 360.0) return null 
+        
+        val rEarth = 6378137.0 // Raio da Terra em Metros
+        val centerLat = Math.toRadians(center.latitude)
+        val centerLon = Math.toRadians(center.longitude)
+        val angle = Math.toRadians(headingDeg)
+        
+        // Posição no eixo Y (trás do carro) e distância para os lados (eixo X)
+        val dy = -(lengthMs / 2.0) - 1.5 // Aumentado para 1.5m para não se sobrepor à borda branca do carro
+        val dx1 = -(widthMs / 2.0) - 4.0 // 4 metros extra à esquerda
+        val dx2 = (widthMs / 2.0) + 4.0  // 4 metros extra à direita
+        
+        // Rotação da ponta esquerda
+        val p1x = dx1 * cos(angle) + dy * sin(angle)
+        val p1y = -dx1 * sin(angle) + dy * cos(angle)
+        
+        // Rotação da ponta direita
+        val p2x = dx2 * cos(angle) + dy * sin(angle)
+        val p2y = -dx2 * sin(angle) + dy * cos(angle)
+        
+        val lat1 = centerLat + p1y / rEarth
+        val lon1 = centerLon + p1x / (rEarth * cos(centerLat))
+        val lat2 = centerLat + p2y / rEarth
+        val lon2 = centerLon + p2x / (rEarth * cos(centerLat))
+        
+        val p1 = LatLong(Math.toDegrees(lat1), Math.toDegrees(lon1))
+        val p2 = LatLong(Math.toDegrees(lat2), Math.toDegrees(lon2))
+
+        val graphicFactory = AndroidGraphicFactory.INSTANCE
+        val paintStroke = graphicFactory.createPaint()
+        paintStroke.setColor(graphicFactory.createColor(MapsforgeColor.GREEN))
+        paintStroke.setStyle(Style.STROKE)
+        paintStroke.setStrokeWidth(8f)
+        
+        val polyline = Polyline(paintStroke, graphicFactory)
+        polyline.latLongs.add(p1)
+        polyline.latLongs.add(p2)
         
         return polyline
     }
@@ -168,6 +212,40 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                 val theirEnd = theirLine.latLongs[1]
                 if (segmentsIntersect(myStart, myEnd, theirStart, theirEnd)) {
                     return true
+                }
+            }
+        }
+        return false
+    }
+
+    private fun checkOvertaking(): Boolean {
+        if (overtakingLine == null || overtakingLine!!.latLongs.size < 2) return false
+        val oStart = overtakingLine!!.latLongs[0]
+        val oEnd = overtakingLine!!.latLongs[1]
+
+        for ((id, data) in otherVehicles) {
+            val theirPolygonPoints = data.polygon.latLongs
+            if (theirPolygonPoints.size >= 4) {
+                // Verificar se a nossa linha perpendicular interseta alguma aresta do carro vizinho
+                var intersects = false
+                for (i in 0 until 4) {
+                    val p3 = theirPolygonPoints[i]
+                    val p4 = theirPolygonPoints[(i + 1) % 4]
+                    if (segmentsIntersect(oStart, oEnd, p3, p4)) {
+                        intersects = true
+                        break
+                    }
+                }
+                
+                // Se interseta a linha de ultrapassagem, verifica se o carro vai na mesma direção (paralelo)
+                if (intersects) {
+                    val headingDiff = Math.abs(myHeadingDeg - data.headingDeg)
+                    // Diferença real do ângulo considerando os 360 graus
+                    val diff = Math.min(360.0 - headingDiff, headingDiff)
+                    // Limiar de 30 graus para considerar que vai "paralelo" e está a ultrapassar
+                    if (diff < 30.0) {
+                        return true
+                    }
                 }
             }
         }
@@ -332,7 +410,19 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                 
                 // Forçar a verificação de alarmes (caso o causador da colisão tenha sido removido)
                 val isColliding = checkCollisions()
-                alarmText.visibility = if (isColliding) android.view.View.VISIBLE else android.view.View.GONE
+                val isOvertaking = checkOvertaking()
+
+                if (isColliding) {
+                    alarmText.visibility = android.view.View.VISIBLE
+                    alarmText.text = "⚠ PERIGO DE COLISÃO! ⚠"
+                    alarmText.setBackgroundColor(Color.RED)
+                } else if (isOvertaking) {
+                    alarmText.visibility = android.view.View.VISIBLE
+                    alarmText.text = "⚠ AVISO: ULTRAPASSAGEM ⚠"
+                    alarmText.setBackgroundColor(Color.parseColor("#FFA500"))
+                } else {
+                    alarmText.visibility = android.view.View.GONE
+                }
                 
                 delay(1000) // Repetir a verificação a cada 1 segundo
             }
@@ -384,6 +474,7 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                                     // SOU EU (144) -> Focar a câmara no novo sítio
                                     Log.d("AdasMapUDP", "Centrando e atualizando o nosso carro (144)")
                                     mapView.model.mapViewPosition.center = newLocation
+                                    myHeadingDeg = headingDeg
                                     
                                     // 1) Atualiza o Polígono recriando a camada (Azul para nós)
                                     mapView.layerManager.layers.remove(locationPolygon)
@@ -395,6 +486,11 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                                     locationLine = createPredictionLine(newLocation, speedMs, headingDeg)
                                     if (locationLine != null) mapView.layerManager.layers.add(locationLine)
                                     
+                                    // 3) Atualiza a linha de ultrapassagem (GREEN)
+                                    if (overtakingLine != null) mapView.layerManager.layers.remove(overtakingLine)
+                                    overtakingLine = createOvertakingLine(newLocation, length, width, headingDeg)
+                                    if (overtakingLine != null) mapView.layerManager.layers.add(overtakingLine)
+                                    
                                     debugText.text = "SUCESSO!\nO Nosso Carro (144):\nLat: $lat\nLon: $lon\nVel: $speedMs m/s"
                                 } else {
                                     // SÃO OUTROS CARROS -> Atualiza posição sem centralizar o ecrã
@@ -403,6 +499,7 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                                         
                                         // 1) Atualiza o centro guardado
                                         oldData.center = newLocation
+                                        oldData.headingDeg = headingDeg
                                         
                                         // 2) Atualiza polígono visível (vermelho)
                                         mapView.layerManager.layers.remove(oldData.polygon)
@@ -433,15 +530,24 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                                         if (newLine != null) mapView.layerManager.layers.add(newLine)
                                         mapView.layerManager.layers.add(newPolygon)
                                         
-                                        otherVehicles[stationId] = VehicleData(newPolygon, newLocation, newLine, System.currentTimeMillis())
+                                        otherVehicles[stationId] = VehicleData(newPolygon, newLocation, newLine, System.currentTimeMillis(), headingDeg)
                                     }
                                     
                                     debugText.text = "PONTO RECEBIDO!\nCarro $stationId\nVelocidade: $speedMs m/s"
                                 }
                                 
-                                // ======== VERIFICAR COLISÕES A CADA ATUALIZAÇÃO ========
-                                if (checkCollisions()) {
+                                // ======== VERIFICAR COLISÕES / ULTRAPASSAGENS A CADA ATUALIZAÇÃO ========
+                                val isColliding = checkCollisions()
+                                val isOvertaking = checkOvertaking()
+
+                                if (isColliding) {
                                     alarmText.visibility = android.view.View.VISIBLE
+                                    alarmText.text = "⚠ PERIGO DE COLISÃO! ⚠"
+                                    alarmText.setBackgroundColor(Color.RED)
+                                } else if (isOvertaking) {
+                                    alarmText.visibility = android.view.View.VISIBLE
+                                    alarmText.text = "⚠ AVISO: ULTRAPASSAGEM ⚠"
+                                    alarmText.setBackgroundColor(Color.parseColor("#FFA500")) // Laranja
                                 } else {
                                     alarmText.visibility = android.view.View.GONE
                                 }
