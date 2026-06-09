@@ -39,7 +39,8 @@ import kotlin.math.sin
 class MainActivity : ComponentActivity() { // <-- Alterado aqui
 
     private lateinit var mapView: MapView
-    private lateinit var debugText: TextView
+    private lateinit var myCarDebugText: TextView
+    private lateinit var otherCarsDebugText: TextView
     private lateinit var alarmText: TextView // NOVO: Texto de Alarme UI
     
     // Mantemos apenas o Polygon (em metros reais) como representação visual
@@ -302,22 +303,42 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
         mapView = MapView(this)
         frameLayout.addView(mapView)
 
-        // Criar uma caixa de texto transparente para os Logs no ecrã
-        debugText = TextView(this).apply {
-            text = "A aguardar ligação da APU... (porta 5000)"
+        // Criar caixas de texto transparentes para os Logs no ecrã (Separadas)
+        myCarDebugText = TextView(this).apply {
+            text = "A aguardar ligação... (Meu Carro)"
             setBackgroundColor(Color.parseColor("#90000000")) // Fundo preto semi-transparente
             setTextColor(Color.WHITE)
             setPadding(32, 32, 32, 32)
             textSize = 14f
         }
         
-        val params = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, 
+        val myCarParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, 
             FrameLayout.LayoutParams.WRAP_CONTENT
         ).apply {
-            gravity = Gravity.BOTTOM // Fica colado à parte de baixo do ecrã
+            gravity = Gravity.BOTTOM or Gravity.START // Fica colado à parte de baixo à esquerda
+            bottomMargin = 16
+            marginStart = 16
         }
-        frameLayout.addView(debugText, params)
+        frameLayout.addView(myCarDebugText, myCarParams)
+
+        otherCarsDebugText = TextView(this).apply {
+            text = "A aguardar ligação... (Outros)"
+            setBackgroundColor(Color.parseColor("#90000000")) // Fundo preto semi-transparente
+            setTextColor(Color.WHITE)
+            setPadding(32, 32, 32, 32)
+            textSize = 14f
+        }
+        
+        val otherCarsParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, 
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.END // Fica colado à parte de baixo à direita
+            bottomMargin = 16
+            marginEnd = 16
+        }
+        frameLayout.addView(otherCarsDebugText, otherCarsParams)
 
         // ======= ALARME DE COLISÃO =========
         alarmText = TextView(this).apply {
@@ -491,7 +512,7 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                                     overtakingLine = createOvertakingLine(newLocation, length, width, headingDeg)
                                     if (overtakingLine != null) mapView.layerManager.layers.add(overtakingLine)
                                     
-                                    debugText.text = "SUCESSO!\nO Nosso Carro (144):\nLat: $lat\nLon: $lon\nVel: $speedMs m/s"
+                                    myCarDebugText.text = "SUCESSO!\nO Nosso Carro (144):\nLat: $lat\nLon: $lon\nVel: $speedMs m/s"
                                 } else {
                                     // SÃO OUTROS CARROS -> Atualiza posição sem centralizar o ecrã
                                     if (otherVehicles.containsKey(stationId)) {
@@ -533,7 +554,7 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                                         otherVehicles[stationId] = VehicleData(newPolygon, newLocation, newLine, System.currentTimeMillis(), headingDeg)
                                     }
                                     
-                                    debugText.text = "PONTO RECEBIDO!\nCarro $stationId\nVelocidade: $speedMs m/s"
+                                    otherCarsDebugText.text = "PONTO RECEBIDO!\nCarro $stationId\nVelocidade: $speedMs m/s"
                                 }
                                 
                                 // ======== VERIFICAR COLISÕES / ULTRAPASSAGENS A CADA ATUALIZAÇÃO ========
@@ -555,20 +576,20 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                         } else {
                             Log.w("AdasMapUDP", "O JSON recebido não contém 'latitude' ou 'longitude'")
                             withContext(Dispatchers.Main) {
-                                debugText.text = "Aviso: JSON incompleto.\nRaw: $message"
+                                otherCarsDebugText.text = "Aviso: JSON incompleto.\nRaw: $message"
                             }
                         }
                     } catch (e: Exception) {
                         Log.e("AdasMapUDP", "Erro ao processar JSON: ${e.message}")
                         withContext(Dispatchers.Main) {
-                            debugText.text = "Erro JSON.\nRaw recebido: $message"
+                            otherCarsDebugText.text = "Erro JSON.\nRaw recebido: $message"
                         }
                     }
                 }
             } catch (e: Exception) {
                 Log.e("AdasMapUDP", "Erro fatal no socket: ${e.message}")
                 withContext(Dispatchers.Main) {
-                    debugText.text = "Erro no Socket UDP:\n${e.message}"
+                    otherCarsDebugText.text = "Erro no Socket UDP:\n${e.message}"
                 }
             } finally {
                 socket?.close()
