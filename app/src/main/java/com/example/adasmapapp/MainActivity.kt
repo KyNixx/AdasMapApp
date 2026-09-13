@@ -26,7 +26,17 @@ import android.util.Log
 import android.widget.FrameLayout
 import android.widget.TextView
 import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
+import android.animation.ObjectAnimator
+import android.animation.ValueAnimator
+import android.content.Context
+import android.media.MediaPlayer
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import org.mapsforge.core.graphics.Style
 import org.mapsforge.core.graphics.Color as MapsforgeColor
 import org.mapsforge.map.layer.overlay.Polygon
@@ -42,6 +52,13 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
     private lateinit var myCarDebugText: TextView
     private lateinit var otherCarsDebugText: TextView
     private lateinit var alarmText: TextView // NOVO: Texto de Alarme UI
+    private lateinit var borderOverlay: android.view.View // NOVO: Borda visual ao redor do ecrã
+    
+    // Animação, Som e Vibração
+    private var pulseAnimator: ObjectAnimator? = null
+    private var mediaPlayer: MediaPlayer? = null
+    private var vibrator: Vibrator? = null
+    private var isAlarmActive = false
     
     // Mantemos apenas o Polygon (em metros reais) como representação visual
     private lateinit var locationPolygon: Polygon
@@ -292,6 +309,85 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
     }
     // -------------------------------------
 
+    private fun startAlarmEffects() {
+        if (isAlarmActive) return
+        isAlarmActive = true
+        
+        pulseAnimator?.start()
+        
+        val pattern = longArrayOf(0, 300, 200) // Espera 0ms, vibra 300ms, pausa 200ms...
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            vibrator?.vibrate(VibrationEffect.createWaveform(pattern, 0))
+        } else {
+            @Suppress("DEPRECATION")
+            vibrator?.vibrate(pattern, 0)
+        }
+        
+        try {
+            if (mediaPlayer == null) {
+                mediaPlayer = MediaPlayer()
+                val afd = assets.openFd("alarmJapan.mp3")
+                mediaPlayer?.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+                mediaPlayer?.isLooping = true
+                mediaPlayer?.prepare()
+            }
+            mediaPlayer?.start()
+        } catch (e: Exception) {
+            Log.e("AdasMapUDP", "Erro som: ${e.message}")
+        }
+    }
+
+    private fun stopAlarmEffects() {
+        if (!isAlarmActive) return
+        isAlarmActive = false
+        
+        pulseAnimator?.cancel()
+        borderOverlay.alpha = 1.0f
+        
+        vibrator?.cancel()
+        
+        mediaPlayer?.pause()
+        mediaPlayer?.seekTo(0)
+    }
+
+    private fun updateAlarmUI(isColliding: Boolean, isOvertaking: Boolean) {
+        if (isColliding) {
+            startAlarmEffects()
+            alarmText.visibility = android.view.View.VISIBLE
+            alarmText.text = "⚠ PERIGO DE COLISÃO! ⚠"
+            alarmText.background = GradientDrawable().apply {
+                setColor(Color.parseColor("#E53935")) // Vermelho mais vibrante e moderno
+                cornerRadius = 24f // Cantos arredondados
+            }
+
+            borderOverlay.background = GradientDrawable().apply {
+                setColor(Color.TRANSPARENT)
+                setStroke(20, Color.parseColor("#E53935")) // Borda grossa vermelha à volta do ecrã inteiro
+            }
+            borderOverlay.visibility = android.view.View.VISIBLE
+
+        } else if (isOvertaking) {
+            startAlarmEffects()
+            alarmText.visibility = android.view.View.VISIBLE
+            alarmText.text = "⚠ AVISO: ULTRAPASSAGEM ⚠"
+            alarmText.background = GradientDrawable().apply {
+                setColor(Color.parseColor("#FB8C00")) // Laranja moderno
+                cornerRadius = 24f
+            }
+
+            borderOverlay.background = GradientDrawable().apply {
+                setColor(Color.TRANSPARENT)
+                setStroke(20, Color.parseColor("#FB8C00")) // Borda grossa laranja
+            }
+            borderOverlay.visibility = android.view.View.VISIBLE
+
+        } else {
+            stopAlarmEffects()
+            alarmText.visibility = android.view.View.GONE
+            borderOverlay.visibility = android.view.View.GONE
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -340,22 +436,48 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
         }
         frameLayout.addView(otherCarsDebugText, otherCarsParams)
 
+        // ======= OVERLAY DA BORDA =========
+        borderOverlay = android.view.View(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+            visibility = android.view.View.GONE
+            elevation = 9f // Fica por baixo do texto de alarme, mas por cima do mapa
+        }
+        frameLayout.addView(borderOverlay)
+
+        // ======= INICIALIZAÇÃO DE EFEITOS =========
+        vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vibratorManager = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+            vibratorManager.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        }
+        
+        pulseAnimator = ObjectAnimator.ofFloat(borderOverlay, "alpha", 0.2f, 1.0f).apply {
+            duration = 300 // milissegundos
+            repeatMode = ValueAnimator.REVERSE
+            repeatCount = ValueAnimator.INFINITE
+        }
+
         // ======= ALARME DE COLISÃO =========
         alarmText = TextView(this).apply {
-            text = "⚠ PERIGO DE COLISÃO! ⚠"
-            setBackgroundColor(Color.RED)
             setTextColor(Color.WHITE)
-            setPadding(32, 32, 32, 32)
-            textSize = 22f
+            setTypeface(null, Typeface.BOLD) // Letra mais grossa (Bold)
+            setPadding(48, 32, 48, 32) // Mais padding horizontal
+            textSize = 24f // Fonte maior
             gravity = Gravity.CENTER
             visibility = android.view.View.GONE // Escondido por defeito
             elevation = 10f // Manter na frente do mapa
         }
         val alarmParams = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, 
+            FrameLayout.LayoutParams.WRAP_CONTENT, 
             FrameLayout.LayoutParams.WRAP_CONTENT
         ).apply {
-            gravity = Gravity.TOP // Fica colado no topo
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL // Centrado no ecrã horizontalmente
+            topMargin = 90 // Fica ligeiramente abaixo do topo para não colar e ter um visual "pop-up"
         }
         frameLayout.addView(alarmText, alarmParams)
         // ===================================
@@ -430,20 +552,7 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                 }
                 
                 // Forçar a verificação de alarmes (caso o causador da colisão tenha sido removido)
-                val isColliding = checkCollisions()
-                val isOvertaking = checkOvertaking()
-
-                if (isColliding) {
-                    alarmText.visibility = android.view.View.VISIBLE
-                    alarmText.text = "⚠ PERIGO DE COLISÃO! ⚠"
-                    alarmText.setBackgroundColor(Color.RED)
-                } else if (isOvertaking) {
-                    alarmText.visibility = android.view.View.VISIBLE
-                    alarmText.text = "⚠ AVISO: ULTRAPASSAGEM ⚠"
-                    alarmText.setBackgroundColor(Color.parseColor("#FFA500"))
-                } else {
-                    alarmText.visibility = android.view.View.GONE
-                }
+                updateAlarmUI(checkCollisions(), checkOvertaking())
                 
                 delay(1000) // Repetir a verificação a cada 1 segundo
             }
@@ -481,7 +590,11 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                             val stationId = if (json.has("stationID")) json.getInt("stationID") else 144
                             
                             val speedMs = if (json.has("speed")) json.getDouble("speed") else 0.0
-                            val headingDeg = if (json.has("heading")) json.getDouble("heading") else 3601.0
+                            // Correção ETSI C-ITS: A norma debaixo dita que o heading real vem num DE_HeadingValue inteiro 0-3600 
+                            // que representa saltos de 0.1 graus. Temos de dividir pelo fator 10 para converter em graus precisos.
+                            val rawHeading = if (json.has("heading")) json.getDouble("heading") else 36010.0
+                            val headingDeg = rawHeading / 10.0
+                            
                             val length = if (json.has("length")) json.getDouble("length") else 4.0
                             val width = if (json.has("width")) json.getDouble("width") else 2.0
 
@@ -558,20 +671,7 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
                                 }
                                 
                                 // ======== VERIFICAR COLISÕES / ULTRAPASSAGENS A CADA ATUALIZAÇÃO ========
-                                val isColliding = checkCollisions()
-                                val isOvertaking = checkOvertaking()
-
-                                if (isColliding) {
-                                    alarmText.visibility = android.view.View.VISIBLE
-                                    alarmText.text = "⚠ PERIGO DE COLISÃO! ⚠"
-                                    alarmText.setBackgroundColor(Color.RED)
-                                } else if (isOvertaking) {
-                                    alarmText.visibility = android.view.View.VISIBLE
-                                    alarmText.text = "⚠ AVISO: ULTRAPASSAGEM ⚠"
-                                    alarmText.setBackgroundColor(Color.parseColor("#FFA500")) // Laranja
-                                } else {
-                                    alarmText.visibility = android.view.View.GONE
-                                }
+                                updateAlarmUI(checkCollisions(), checkOvertaking())
                             }
                         } else {
                             Log.w("AdasMapUDP", "O JSON recebido não contém 'latitude' ou 'longitude'")
@@ -598,6 +698,9 @@ class MainActivity : ComponentActivity() { // <-- Alterado aqui
     }
 
     override fun onDestroy() {
+        stopAlarmEffects()
+        mediaPlayer?.release()
+        mediaPlayer = null
         mapView.destroyAll()
         AndroidGraphicFactory.clearResourceMemoryCache()
         super.onDestroy()
